@@ -46,7 +46,7 @@ Người dùng → (443, TLS) → Traefik → (network chung, HTTP 80) → proxy
 ```
 
 - `./plane build` dùng fragment `proxy.traefik.md` (gắn labels, nối network external, không publish cổng host) và thêm khối `networks:` external.
-- `SITE_ADDRESS=:80`, `APP_PROTOCOL=https`, `WEB_URL=https://<DOMAIN>`.
+- `SITE_ADDRESS=:80`, `APP_PROTOCOL=https`, `WEB_URL=https://<DOMAIN>`, `MINIO_ENDPOINT_SSL=1` (ép URL upload dùng `https`, tránh lỗi mixed content). Khi `TRAEFIK_TLS=false` (vd `.localhost`) thì dùng `http` và `MINIO_ENDPOINT_SSL=0`.
 - Cần: `TRAEFIK_NETWORK`, `CERT_RESOLVER`, `TRAEFIK_ENTRYPOINT` khớp với Traefik của bạn.
 
 **`USE_TRAEFIK=false` — chạy Plane mặc định, không thêm gì:**
@@ -69,7 +69,7 @@ Chỉ có một CLI duy nhất: `./plane`. Các lệnh:
 
 - `./plane init` — hỏi-đáp tạo `config.env`.
 - `./plane build` — đọc `config.env`, gộp fragment → `docker-compose.yml` (chuẩn Compose v2, có `name:`, biến render sẵn).
-- `./plane up` — tự `init` nếu thiếu cấu hình → tạo/vá `plane.env` (WEB_URL/CORS theo DOMAIN, sinh SECRET_KEY...) → `build` → bảo đảm network Traefik → `docker compose up -d`.
+- `./plane up` — tự `init` nếu thiếu cấu hình → tạo/vá `plane.env` (WEB_URL/CORS theo DOMAIN, `MINIO_ENDPOINT_SSL` theo HTTPS/HTTP, sinh SECRET_KEY...) → `build` → bảo đảm network Traefik → `docker compose up -d`.
 - `./plane backup` — sao lưu Postgres.
 
 Khi `build`, file compose được gộp như sau:
@@ -250,6 +250,8 @@ docker compose up -d    # áp dụng
 **Không lấy được chứng chỉ HTTPS.** DNS chưa trỏ đúng IP, hoặc cổng 80 (HTTP-01) chưa mở tới Traefik. Xem log Traefik.
 
 **WebSocket lỗi / không cập nhật thời gian thực.** Thường do `WEB_URL` không khớp domain thật. Bảo đảm `WEB_URL=https://<DOMAIN>` và `CORS_ALLOWED_ORIGINS` cùng giá trị, rồi `docker compose restart`.
+
+**Tạo project / upload ảnh cover báo "Failed to upload" (hoặc upload file đính kèm lỗi).** Trang chạy HTTPS nhưng Plane sinh URL upload `http://` → browser chặn *Mixed Content*. Mở DevTools › Network sẽ thấy `POST http://<DOMAIN>/uploads` bị chặn. Nguyên nhân: TLS terminate ở tầng trên (Traefik/Cloudflare) nên `api` thấy request là HTTP, mà mặc định Plane lấy scheme của upload URL theo request. Khắc phục: đặt `MINIO_ENDPOINT_SSL=1` trong `plane.env` rồi `docker compose up -d` (ép presigned URL dùng `https`). CLI `./plane` tự đặt `=1` khi `USE_TRAEFIK=true` + `TRAEFIK_TLS=true`; nếu TLS do Cloudflare/upstream lo (vd standalone sau Cloudflare) thì đặt tay `=1`.
 
 **`migrator` lặp lại hoặc lỗi.** Postgres chưa sẵn sàng. Xem `docker compose logs plane-db`, đợi DB lên rồi `docker compose restart migrator`.
 
