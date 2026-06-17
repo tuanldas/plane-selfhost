@@ -1,0 +1,13 @@
+# Cấu hình thật + secret — KHÔNG commit
+config.env
+plane.env
+*.bak
+
+# Compose tự sinh từ services-md/ (chạy ./build.sh để tạo lại)
+docker-compose.yml
+docker-compose.generated.yml
+docker-compose.traefik.yml
+
+# Dữ liệu & sao lưu
+backups/
+volumes/

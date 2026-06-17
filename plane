@@ -1,0 +1,226 @@
+#!/usr/bin/env bash
+# =============================================================================
+# plane — CLI gọn để dựng/vận hành 1 instance Plane self-host (1 server = 1 Plane).
+#
+#   ./plane init     Tạo config.env + plane.env (hỏi-đáp)
+#   ./plane up       Build compose + khởi động (tự init nếu thiếu cấu hình)
+#   ./plane build    Render lại docker-compose.yml từ services-md/
+#   ./plane backup   Sao lưu Postgres ra ./backups
+#
+# Mọi thao tác docker khác dùng trực tiếp: docker compose ps|logs -f|down|up -d|restart
+# (file docker-compose.yml đã có "name:" nên không cần cờ -f/-p/--env-file).
+# =============================================================================
+set -euo pipefail
+cd "$(dirname "$0")"
+
+MD_DIR="services-md"; OUT="docker-compose.yml"; ENV_FILE="plane.env"
+red()   { printf '\033[31m%s\033[0m\n' "$*"; }
+green() { printf '\033[32m%s\033[0m\n' "$*"; }
+info()  { printf '\033[36m==>\033[0m %s\n' "$*"; }
+ask()   { local q="$1" d="${2:-}" a; if [ -n "$d" ]; then read -r -p "$q [$d]: " a; echo "${a:-$d}"; else read -r -p "$q: " a; echo "$a"; fi; }
+yesno() { local q="$1" d="${2:-Y}" a; read -r -p "$q [$([ "$d" = Y ] && echo Y/n || echo y/N)]: " a; a="${a:-$d}"; case "$a" in [yY]*) return 0;; *) return 1;; esac; }
+
+set_env() {  # upsert KEY=VALUE trong plane.env
+  local k="$1" v="$2"
+  if grep -qE "^[#[:space:]]*${k}=" "$ENV_FILE"; then
+    sed -i.bak -E "s|^[#[:space:]]*${k}=.*|${k}=${v}|" "$ENV_FILE" && rm -f "${ENV_FILE}.bak"
+  else printf '%s=%s\n' "$k" "$v" >> "$ENV_FILE"; fi
+}
+
+# ---------------------------------------------------------------- init --------
+cmd_init() {
+  if [ -f config.env ] && ! yesno "config.env đã tồn tại. Ghi đè?" "N"; then
+    info "Giữ nguyên config.env."; return 0
+  fi
+  echo "=== Thiết lập instance Plane ==="
+  local DOMAIN PLANE_INSTANCE USE_TRAEFIK TRAEFIK_NETWORK TRAEFIK_TLS CERT_RESOLVER TRAEFIK_ENTRYPOINT
+  DOMAIN="$(ask 'Domain truy cập Plane (vd plane.congty.vn)')"
+  PLANE_INSTANCE="$(ask 'Tên định danh instance (a-z,0-9,-)' 'plane')"
+  if yesno "Server có Traefik external chạy sẵn? (Có = chạy sau Traefik)" "Y"; then
+    USE_TRAEFIK=true
+    TRAEFIK_NETWORK="$(ask 'Network external của Traefik' 'traefik-public')"
+    if yesno "Dùng HTTPS/Let's Encrypt? (Không nếu domain .localhost / test local)" "Y"; then
+      TRAEFIK_TLS=true
+      TRAEFIK_ENTRYPOINT="$(ask 'Entrypoint HTTPS của Traefik' 'websecure')"
+      CERT_RESOLVER="$(ask 'certResolver trong Traefik (phải khớp ĐÚNG tên)' 'letsencrypt')"
+    else
+      TRAEFIK_TLS=false
+      TRAEFIK_ENTRYPOINT="$(ask 'Entrypoint HTTP của Traefik' 'web')"
+      CERT_RESOLVER=letsencrypt
+      info "Sẽ route qua HTTP, không TLS."
+    fi
+  else
+    USE_TRAEFIK=false; TRAEFIK_NETWORK=traefik-public; TRAEFIK_TLS=true; CERT_RESOLVER=letsencrypt; TRAEFIK_ENTRYPOINT=websecure
+    info "Sẽ chạy Plane mặc định (không Traefik)."
+  fi
+  cat > config.env <<EOF
+DOMAIN=${DOMAIN}
+PLANE_INSTANCE=${PLANE_INSTANCE}
+
+# true = sau Traefik external | false = chạy Plane mặc định
+USE_TRAEFIK=${USE_TRAEFIK}
+TRAEFIK_NETWORK=${TRAEFIK_NETWORK}
+# true = HTTPS/Let's Encrypt | false = HTTP, không TLS (.localhost/test)
+TRAEFIK_TLS=${TRAEFIK_TLS}
+TRAEFIK_ENTRYPOINT=${TRAEFIK_ENTRYPOINT}
+CERT_RESOLVER=${CERT_RESOLVER}
+
+# Service hạ tầng: internal = chạy trong stack | external = dùng dịch vụ ngoài (khai trong plane.env)
+DB_MODE=internal
+REDIS_MODE=internal
+MQ_MODE=internal
+STORAGE_MODE=internal
+EOF
+  green "Đã tạo config.env."
+}
+
+# ---------------------------------------------------------------- build -------
+cmd_build() {
+  [ -f config.env ] || { red "Thiếu config.env. Chạy: ./plane init"; exit 1; }
+  # shellcheck disable=SC1091
+  set -a; source config.env; set +a
+  local USE_TRAEFIK="${USE_TRAEFIK:-true}"
+  local DB_MODE="${DB_MODE:-internal}" REDIS_MODE="${REDIS_MODE:-internal}"
+  local MQ_MODE="${MQ_MODE:-internal}" STORAGE_MODE="${STORAGE_MODE:-internal}"
+  penv() { grep -E "^$1=" "$ENV_FILE" 2>/dev/null | head -1 | cut -d= -f2- || true; }
+  local APP_RELEASE LISTEN_HTTP_PORT LISTEN_HTTPS_PORT
+  APP_RELEASE="$(penv APP_RELEASE)";            APP_RELEASE="${APP_RELEASE:-stable}"
+  LISTEN_HTTP_PORT="$(penv LISTEN_HTTP_PORT)";  LISTEN_HTTP_PORT="${LISTEN_HTTP_PORT:-80}"
+  LISTEN_HTTPS_PORT="$(penv LISTEN_HTTPS_PORT)"; LISTEN_HTTPS_PORT="${LISTEN_HTTPS_PORT:-443}"
+
+  extract() { local f="$MD_DIR/$1"; [ -f "$f" ] || { red "Thiếu fragment: $f"; exit 1; }; awk '/^```yaml/{f=1;next} /^```/{if(f)exit} f' "$f"; }
+  render() {
+    sed -e "s|\${APP_RELEASE:-stable}|${APP_RELEASE}|g" \
+        -e "s|\${LISTEN_HTTP_PORT:-80}|${LISTEN_HTTP_PORT}|g" \
+        -e "s|\${LISTEN_HTTPS_PORT:-443}|${LISTEN_HTTPS_PORT}|g" \
+        -e "s|\${DOMAIN}|${DOMAIN:-}|g" \
+        -e "s|\${PLANE_INSTANCE}|${PLANE_INSTANCE:-plane}|g" \
+        -e "s|\${TRAEFIK_NETWORK}|${TRAEFIK_NETWORK:-}|g" \
+        -e "s|\${CERT_RESOLVER}|${CERT_RESOLVER:-}|g" \
+        -e "s|\${TRAEFIK_ENTRYPOINT}|${TRAEFIK_ENTRYPOINT:-}|g"
+  }
+
+  local CORE="web.md space.md admin.md live.md api.md worker.md beat-worker.md migrator.md"
+  local INFRA="" VOLUMES=""
+  [ "$DB_MODE" = internal ]      && { INFRA="$INFRA plane-db.md";    VOLUMES="$VOLUMES pgdata"; }
+  [ "$REDIS_MODE" = internal ]   && { INFRA="$INFRA plane-redis.md"; VOLUMES="$VOLUMES redisdata"; }
+  [ "$MQ_MODE" = internal ]      && { INFRA="$INFRA plane-mq.md";    VOLUMES="$VOLUMES rabbitmq_data"; }
+  [ "$STORAGE_MODE" = internal ] && { INFRA="$INFRA plane-minio.md"; VOLUMES="$VOLUMES uploads"; }
+  local PROXY
+  if [ "$USE_TRAEFIK" = true ]; then
+    if [ "${TRAEFIK_TLS:-true}" = true ]; then PROXY="proxy.traefik.md"; else PROXY="proxy.traefik-notls.md"; fi
+  else PROXY="proxy.standalone.md"; fi
+
+  info "Gộp compose → $OUT"
+  {
+    echo "# === FILE TỰ SINH bởi ./plane build — KHÔNG sửa tay. Sửa trong services-md/ ==="
+    echo "# USE_TRAEFIK=$USE_TRAEFIK DB=$DB_MODE REDIS=$REDIS_MODE MQ=$MQ_MODE STORAGE=$STORAGE_MODE APP_RELEASE=$APP_RELEASE"
+    echo; echo "name: ${PLANE_INSTANCE:-plane}"; echo
+    extract 00-base.md | render; echo
+    echo "services:"
+    for f in $CORE $INFRA $PROXY; do extract "$f" | render; echo; done
+    if [ -n "$VOLUMES" ]; then echo "volumes:"; for v in $VOLUMES; do echo "  $v:"; done; echo; fi
+    if [ "$USE_TRAEFIK" = true ]; then
+      echo "networks:"; echo "  default:"; echo "  traefik-net:"; echo "    external: true"; echo "    name: ${TRAEFIK_NETWORK}"
+    fi
+  } > "$OUT"
+  info "Service bật: $(echo $CORE $INFRA $PROXY | sed 's/\.md//g')"
+}
+
+# ---------------------------------------------------------------- up ----------
+cmd_up() {
+  [ -f config.env ] || cmd_init
+  # shellcheck disable=SC1091
+  set -a; source config.env; set +a
+  : "${DOMAIN:?Thiếu DOMAIN}"; : "${PLANE_INSTANCE:?Thiếu PLANE_INSTANCE}"
+  local USE_TRAEFIK="${USE_TRAEFIK:-true}"
+
+  command -v docker >/dev/null || { red "Chưa cài docker."; exit 1; }
+  docker compose version >/dev/null 2>&1 || { red "Cần Docker Compose v2."; exit 1; }
+
+  [ -f "$ENV_FILE" ] || { info "Tạo $ENV_FILE từ plane.env.example"; cp plane.env.example "$ENV_FILE"; }
+
+  set_env TRUSTED_PROXIES "0.0.0.0/0"
+  if [ "$USE_TRAEFIK" = true ]; then
+    info "Chế độ: sau Traefik external (Traefik lo TLS)."
+    set_env WEB_URL "https://${DOMAIN}"; set_env CORS_ALLOWED_ORIGINS "https://${DOMAIN}"
+    set_env APP_PROTOCOL https; set_env SITE_ADDRESS ":80"
+  else
+    info "Chế độ: mặc định (không Traefik)."
+    set_env WEB_URL "http://${DOMAIN}"; set_env CORS_ALLOWED_ORIGINS "http://${DOMAIN}"
+  fi
+
+  gen() { openssl rand -hex 32 2>/dev/null || head -c32 /dev/urandom | od -An -tx1 | tr -d ' \n'; }
+  local CUR; CUR="$(grep -E '^SECRET_KEY=' "$ENV_FILE" | head -1 | cut -d= -f2- || true)"
+  if [ -z "$CUR" ] || echo "$CUR" | grep -qiE 'change|example'; then
+    set_env SECRET_KEY "$(gen)"; green "Đã sinh SECRET_KEY mới."
+  fi
+  local LIVE; LIVE="$(grep -E '^LIVE_SERVER_SECRET_KEY=' "$ENV_FILE" | head -1 | cut -d= -f2- || true)"
+  if [ -z "$LIVE" ]; then set_env LIVE_SERVER_SECRET_KEY "$(gen)"; green "Đã sinh LIVE_SERVER_SECRET_KEY."; fi
+
+  cmd_build
+
+  if [ "$USE_TRAEFIK" = true ] && ! docker network inspect "${TRAEFIK_NETWORK}" >/dev/null 2>&1; then
+    red "Network '${TRAEFIK_NETWORK}' chưa tồn tại."
+    if yesno "Tạo network external này?" "N"; then docker network create "${TRAEFIK_NETWORK}"; else
+      red "Hãy bảo đảm Traefik & Plane dùng chung network rồi chạy lại."; exit 1; fi
+  fi
+
+  info "Khởi động (lần đầu mất vài phút kéo image + migrate)..."
+  docker compose up -d
+  green "Xong."
+  echo "  • Migrate:  docker compose logs -f migrator"
+  echo "  • Quản lý:  docker compose ps | logs -f | down | up -d"
+  if [ "$USE_TRAEFIK" = true ]; then echo "  • Truy cập: https://${DOMAIN}  (god-mode: /god-mode)";
+  else echo "  • Truy cập: http://${DOMAIN}  (god-mode: /god-mode)"; fi
+}
+
+# ---------------------------------------------------------------- backup ------
+cmd_backup() {
+  mkdir -p backups
+  docker compose exec -T plane-db pg_dump -U plane plane > "backups/plane-db-$(date +%Y%m%d-%H%M%S).sql"
+  green "Đã lưu vào ./backups/"
+}
+
+cmd_swap() {
+  local size="${1:-4G}" file="/swapfile"
+  if [ "$(uname -s)" != "Linux" ]; then
+    red "Lệnh swap chỉ dùng trên server Linux. (macOS: swap do Docker Desktop VM quản lý.)"; exit 1
+  fi
+  [ "$(id -u)" -eq 0 ] || { red "Cần quyền root: sudo ./plane swap $size"; exit 1; }
+  if swapon --show 2>/dev/null | grep -q "$file"; then
+    info "$file đã bật:"; swapon --show; return 0
+  fi
+  info "Tạo swap $size tại $file ..."
+  if ! fallocate -l "$size" "$file" 2>/dev/null; then
+    local n="${size%[GgMm]}" u="${size##*[0-9]}" mb
+    case "$u" in [Gg]) mb=$((n*1024));; *) mb="$n";; esac
+    dd if=/dev/zero of="$file" bs=1M count="$mb" status=progress
+  fi
+  chmod 600 "$file"; mkswap "$file"; swapon "$file"
+  grep -q "$file" /etc/fstab || echo "$file none swap sw 0 0" >> /etc/fstab
+  green "Đã bật swap (giữ qua reboot nhờ /etc/fstab):"; swapon --show; free -h
+}
+
+cmd_help() {
+  cat <<'EOF'
+plane — CLI gọn dựng/vận hành 1 instance Plane self-host (1 server = 1 Plane).
+
+  ./plane init        Tạo config.env + plane.env (hỏi-đáp)
+  ./plane up          Build compose + khởi động (tự init nếu thiếu cấu hình)
+  ./plane build       Render lại docker-compose.yml từ services-md/
+  ./plane backup      Sao lưu Postgres ra ./backups
+  ./plane swap [SIZE] Tạo swapfile trên server Linux (mặc định 4G; cần sudo)
+
+Thao tác docker khác: docker compose ps | logs -f | down | up -d | restart
+EOF
+}
+
+case "${1:-help}" in
+  init)   cmd_init ;;
+  up)     cmd_up ;;
+  build)  cmd_build ;;
+  backup) cmd_backup ;;
+  swap)   cmd_swap "${2:-}" ;;
+  *)      cmd_help ;;
+esac
